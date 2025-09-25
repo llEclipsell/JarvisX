@@ -1,0 +1,1198 @@
+
+-> main.rs :
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use serde::{Deserialize, Serialize};
+use std::process::{Command, Stdio, Child};
+use std::sync::Mutex;
+use std::thread;
+use std::env;
+use std::time::Instant;
+use tauri::{Manager, AppHandle, Emitter, PhysicalPosition};
+use std::io::Read;
+use regex::Regex;
+
+// --- UPDATED: Correct imports for the global shortcut plugin ---
+use tauri_plugin_global_shortcut::{GlobalShortcutExt};
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+
+// --- Shared State to hold the running process ---
+struct AppState {
+    transcription_process: Option<Child>,
+    click_through_enabled: bool,
+    last_shortcut_time: Instant
+}
+impl AppState {
+    fn new() -> Self {
+        Self { 
+            transcription_process: None,
+            click_through_enabled: true,
+            last_shortcut_time: Instant::now()
+        }
+    }
+}
+
+// --- Live Transcription using whisper-stream.exe ---
+#[tauri::command]
+fn start_live_transcription(
+    app_handle: AppHandle,
+    stream_exe_path: String,
+    model_path: String,
+    state: tauri::State<Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut state_guard = state.lock().unwrap();
+    let mut command = Command::new(&stream_exe_path);
+    command.args(["-m", &model_path, "-t", "8"]);
+    command.stdout(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("Failed to spawn process: {}", e))?;
+    let mut stdout = child.stdout.take().expect("Failed to capture stdout");
+
+    // Precompile ANSI escape regex (e.g. \x1b[...m or \x1b[2K)
+    let ansi_re = Regex::new(r"\x1B\[[0-?]*[ -/]*[@-~]").unwrap();
+
+    // Spawn thread to read raw bytes from stdout and detect \r vs \n
+    let app_handle_clone = app_handle.clone();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 1024];
+        let mut acc: Vec<u8> = Vec::new();
+
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    // EOF
+                    if !acc.is_empty() {
+                        if let Ok(s) = String::from_utf8(acc.clone()) {
+                            let cleaned = ansi_re.replace_all(&s, "").to_string().trim().to_string();
+                            if !cleaned.is_empty() {
+                                let _ = app_handle_clone.emit("final_transcription", cleaned);
+                            }
+                        }
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    for &b in &buffer[..n] {
+                        match b {
+                            b'\r' => {
+                                // Interim update: emit current accumulator as "in-progress"
+                                if !acc.is_empty() {
+                                    if let Ok(s) = String::from_utf8(acc.clone()) {
+                                        let cleaned = ansi_re.replace_all(&s, "").to_string().trim().to_string();
+                                        if !cleaned.is_empty() {
+                                            let _ = app_handle_clone.emit("new_transcription", cleaned.clone());
+                                        }
+                                    }
+                                } else {
+                                    // sometimes \r is followed by new bytes, so emit empty -> ignore
+                                }
+                                // keep acc (some streams update with \r then more bytes, sometimes they also send newline later)
+                                acc.clear(); // optional depending on how the producer behaves
+                            }
+                            b'\n' => {
+                                // Finalized line: emit as final
+                                if !acc.is_empty() {
+                                    if let Ok(s) = String::from_utf8(acc.clone()) {
+                                        let cleaned = ansi_re.replace_all(&s, "").to_string().trim().to_string();
+                                        if !cleaned.is_empty() {
+                                            let _ = app_handle_clone.emit("final_transcription", cleaned.clone());
+                                        }
+                                    }
+                                    acc.clear();
+                                } else {
+                                    // newline with empty acc -> ignore
+                                }
+                            }
+                            _ => {
+                                acc.push(b);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error reading stdout: {}", err);
+                    break;
+                }
+            }
+        }
+    });
+
+    state_guard.transcription_process = Some(child);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_live_transcription(state: tauri::State<Mutex<AppState>>) -> Result<(), String> {
+    let mut state_guard = state.lock().unwrap();
+    if let Some(mut child) = state_guard.transcription_process.take() {
+        child.kill().map_err(|e| format!("Failed to kill process: {}", e))?;
+        println!("Live transcription process stopped.");
+    }
+    Ok(())
+}
+
+// --- Gemini API Logic ---
+#[derive(Serialize)] struct GeminiRequest { contents: Vec<Content> }
+#[derive(Serialize)] struct Content { parts: Vec<Part> }
+#[derive(Serialize)] struct Part { text: String }
+#[derive(Deserialize)] struct GeminiResponse { candidates: Vec<Candidate> }
+#[derive(Deserialize)] struct Candidate { content: ContentResponse }
+#[derive(Deserialize)] struct ContentResponse { parts: Vec<PartResponse> }
+#[derive(Deserialize)] struct PartResponse { text: String }
+
+#[tauri::command]
+async fn call_gemini_api(prompt: String) -> Result<String, String> {
+    let api_key = env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not found in .env file".to_string())?;
+        let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={}",
+        api_key
+    );
+    let request_body = GeminiRequest { contents: vec![Content { parts: vec![Part { text: prompt }] }] };
+    let client = reqwest::Client::new();
+    let response = client.post(&url).json(&request_body).send().await.map_err(|e| format!("Failed to send request to Gemini API: {}", e))?;
+    if response.status().is_success() {
+        let gemini_response = response.json::<GeminiResponse>().await.map_err(|e| format!("Failed to parse Gemini response: {}", e))?;
+        if let Some(candidate) = gemini_response.candidates.get(0) {
+            if let Some(part) = candidate.content.parts.get(0) { return Ok(part.text.clone()); }
+        }
+        Err("No content found in Gemini response".to_string())
+    } else {
+        let error_body = response.text().await.unwrap_or_else(|_| "Unknown API error".to_string());
+        Err(format!("Gemini API error: {}", error_body))
+    }
+}
+
+// --- Window Invisibility Logic ---
+fn make_window_invisible_to_capture(window: &tauri::WebviewWindow) {
+    let hwnd = HWND(window.hwnd().unwrap().0 as isize);
+    unsafe { let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE); }
+}
+
+#[tauri::command]
+fn toggle_clickthrough(
+    window: tauri::WebviewWindow,
+    enable: bool,
+    state: tauri::State<Mutex<AppState>>
+) -> Result<(), String> {
+    // Update window behavior
+    window.set_ignore_cursor_events(enable).map_err(|e| format!("Failed to set clickthrough: {}", e))?;
+
+    // Update shared state
+    let mut state_guard = state.lock().unwrap();
+    state_guard.click_through_enabled = enable;
+
+    // Emit event so frontend stays in sync
+    let _ = window.emit("click_through_toggled", enable);
+
+    Ok(())
+}
+
+fn main() {
+    dotenvy::from_filename("api_keys.env").expect("Failed to load api_keys.env file");
+    
+    tauri::Builder::default()
+        .manage(Mutex::new(AppState::new()))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .setup(|app| {
+            let main_window = app.get_webview_window("main").unwrap();
+
+            // Make invisible to screen capture
+            make_window_invisible_to_capture(&main_window);
+
+            // Transparent + frameless window
+            main_window.set_decorations(false).unwrap();
+            main_window.set_always_on_top(true).unwrap();
+            main_window.set_ignore_cursor_events(true).unwrap(); // allow clicks at startup
+
+            // get monitor size
+            if let Some(monitor) = main_window.current_monitor().unwrap() {
+                let size = monitor.size();
+                
+                // place window at top-center
+                let window_size = main_window.outer_size().unwrap();
+                let x = (size.width / 2) as i32 - (window_size.width as i32 / 2);
+                let y = 0; // very top of the screen
+
+                main_window.set_position(PhysicalPosition::new(x, y)).unwrap();
+            }
+
+            // Get the shortcut manager
+            let shortcuts = app.global_shortcut();
+            let _app_handle = app.handle().clone();
+
+            // 1. Unregister to prevent hot-reload errors
+            let _ = shortcuts.unregister("Ctrl+Shift+C");
+
+            // 2. Register the shortcut and provide the handler as a second argument
+            shortcuts.on_shortcut("Ctrl+Shift+C", move |app,_shortcut,_event| {
+                let window = app.get_webview_window("main").unwrap();
+                let state = app.state::<Mutex<AppState>>();
+                
+                let mut state_guard = state.lock().unwrap();
+                let now = Instant::now();
+                
+                if now.duration_since(state_guard.last_shortcut_time).as_millis() > 200 {
+                    // Toggle the boolean state
+                    state_guard.click_through_enabled = !state_guard.click_through_enabled;
+                    let is_enabled = state_guard.click_through_enabled;
+                    
+                    // Apply the new state to the window
+                    let _ = window.set_ignore_cursor_events(is_enabled);
+                    
+                    // Emit the new state to the frontend
+                    let _ = window.emit("click_through_toggled", is_enabled);
+
+                    println!("Click-through toggled to: {}", is_enabled);
+                    // Update the timestamp
+                    state_guard.last_shortcut_time = now;
+                }
+            }).expect("Failed to set shortcut handler");  
+                     
+            // hide/show toggle
+            let _ = shortcuts.unregister("Ctrl+Shift+H");
+            shortcuts.on_shortcut("Ctrl+Shift+H", move |app, _shortcut, _event| {
+                if let Some(window) = app.get_webview_window("main") {
+                    
+                    let state = app.state::<Mutex<AppState>>();
+
+                    let now = Instant::now();
+                    let mut state_guard = state.lock().unwrap();
+
+                    if now.duration_since(state_guard.last_shortcut_time).as_millis() > 200 {
+                        if window.is_visible().unwrap_or(false) {
+                            let _ = window.hide();
+                        } 
+                        else {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                        state_guard.last_shortcut_time = now;
+                    }
+                }}).expect("Failed to set visibility toggle shortcut");
+            
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            start_live_transcription,
+            stop_live_transcription,
+            call_gemini_api,
+            toggle_clickthrough
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+
+------------------------------------------------------------------------------
+
+-> App.jsx :
+
+
+
+import { useState, useEffect, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import ReactMarkdown from "react-markdown";
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import logoVideo from './assets/JarvisV2TurqVid.mp4';
+import { resolveResource } from "@tauri-apps/api/path";
+import './App.css';
+
+function App() {
+
+  async function getResourcePaths() {
+    const streamExe = await resolveResource("resources/whisper-stream.exe");
+    const modelBin = await resolveResource("resources/ggml-base.en.bin");
+    // const modelBin = await resolveResource("resources/ggml-medium.en.bin");
+    return { streamExe, modelBin };
+  }
+
+  const [isRecording, setIsRecording] = useState(false);
+  
+  // --- Transcript state is now split for better live updates ---
+  const [finalizedTranscript, setFinalizedTranscript] = useState([]);
+  const [inProgressTranscript, setInProgressTranscript] = useState('');
+  
+  const [aiResponse, setAiResponse] = useState('');
+  const [generalQuery, setGeneralQuery] = useState('');
+  const [status, setStatus] = useState('Ready.');
+  
+  // --- state for click-through and the timer ---
+  const [clickThrough, setClickThrough] = useState(true); // Start as click-through
+  const speechPauseTimer = useRef(null);
+
+  // UI states for widget/panel
+  const [widgetOpen, setWidgetOpen] = useState(true);
+  const [listenOpen, setListenOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState('transcript');
+
+  // Ref to remember previous click-through state during drag
+  const appWindow = useRef(null);
+
+  useEffect(() => {
+    appWindow.current = getCurrentWindow();
+  }, []);
+
+  // --- Updated transcription listener with timer logic ---
+  useEffect(() => {
+    let unlistenInterim;
+    let unlistenFinal;
+
+    const setupListeners = async () => {
+      unlistenInterim = await listen('new_transcription', (event) => {
+        const text = event.payload;
+        // update the in-progress line
+        setInProgressTranscript(text);
+        // reset pause timer as before
+        clearTimeout(speechPauseTimer.current);
+        speechPauseTimer.current = setTimeout(() => {
+          // If we don't get final_transcription after a pause, optionally finalize
+          if (text) {
+            setFinalizedTranscript(prev => [...prev, text]);
+            setInProgressTranscript('');
+          }
+        }, 1500);
+      });
+
+      unlistenFinal = await listen('final_transcription', (event) => {
+        const text = event.payload;
+        if (text) {
+          setFinalizedTranscript(prev => [...prev, text]);
+        }
+        setInProgressTranscript('');
+        // clear timer to avoid double-finalization
+        clearTimeout(speechPauseTimer.current);
+      });
+    };
+
+    setupListeners();
+
+    return () => {
+      if (unlistenInterim) unlistenInterim.then(f => f());
+      if (unlistenFinal) unlistenFinal.then(f => f());
+      clearTimeout(speechPauseTimer.current);
+    };
+  }, []);
+
+
+  // --- Added listener for global shortcut event ---
+  useEffect(() => {
+    const unlisten = listen('click_through_toggled', (event) => {
+      const newState = event.payload; // The backend sends the new boolean state
+      setClickThrough(newState);
+      setStatus(newState ? 'Window is click-through.' : 'Window is interactive.');
+    });
+    
+    // Cleanup the listener when the component unmounts
+    return () => { 
+      unlisten.then(f => f()); 
+    };
+  }, []);
+
+  // --- Start / Stop Live Transcription ---
+  const handleToggleRecording = async () => {
+    if (!isRecording) {
+      try {
+        setStatus('Recording...');
+        // Reset new transcript states ---
+        setFinalizedTranscript([]);
+        setInProgressTranscript('');
+        setAiResponse('');
+
+        const { streamExe, modelBin } = await getResourcePaths();
+
+        await invoke('start_live_transcription', { 
+          streamExePath: streamExe, 
+          modelPath: modelBin
+        });
+        setIsRecording(true);
+      } 
+      catch (error) {
+        console.error(error);
+        setStatus(`Error: ${error}`);
+      }
+    } 
+    else {
+      try {
+        await invoke('stop_live_transcription');
+        // Finalize any remaining text when stopping
+        if (inProgressTranscript) {
+          setFinalizedTranscript(prev => [...prev, inProgressTranscript]);
+        }
+        setInProgressTranscript('');
+        setStatus('Ready.');
+        setIsRecording(false);
+      } catch (error) {
+        console.error(error);
+        setStatus(`Error: ${error}`);
+      }
+    }
+  };
+
+  // --- Ask Gemini API ---
+  const handleAskGemini = async (prompt) => {
+    if (!prompt) return;
+    try {
+      setStatus('Thinking...');
+      const response = await invoke('call_gemini_api', { 
+        prompt: `${prompt}\n\nIMPORTANT: Format your response using Markdown with line breaks, bullet points, and code blocks when relevant.` 
+      });
+      setAiResponse(response);
+      setActiveTab('ai');
+      setStatus('Ready.');
+      setWidgetOpen(true);
+    } catch (error) {
+      console.error(error);
+      setAiResponse(`Error: ${error}`);
+      setActiveTab('ai');
+      setStatus('Ready.');
+      setWidgetOpen(true);
+    }
+  };
+
+  // --- Analyze Transcript ---
+  const handleAnalyze = () => {
+    // Use the combined transcript for analysis
+    const fullTranscript = [...finalizedTranscript, inProgressTranscript].join('\n');
+    handleAskGemini(
+      `You are a helpful AI assistant. 
+       When given a transcript or question:
+       - Give a clear, detailed, yet concise explanation. 
+       - If solving requires code, provide working code snippets. 
+       - If no code is needed, just explain clearly. 
+       - Do not output "Summary" or "Action Items" format. 
+       - Act like a normal conversational assistant.
+
+       Now, based on the following transcript, explain/solve: ${fullTranscript}`
+    );
+  };
+
+  // --- Toggle click-through mode ---
+  const handleToggleClickThrough = async () => {
+    try {
+      const newState = !clickThrough;
+      await invoke('toggle_clickthrough', { enable: newState });
+      setClickThrough(newState);
+      setStatus(newState ? 'Window is click-through.' : 'Window is interactive.');
+    } catch (err) {
+      console.error('Failed to toggle clickthrough:', err);
+    }
+  };
+
+  // Combine transcript parts for display ---
+  const transcript = [...finalizedTranscript, inProgressTranscript].join('\n');
+
+  // Ensure interactive before dragging, remember previous state
+  const startDragWithClickThroughHandling = async (e) => {
+    // stopPropagation so clicks on the bar don't trigger other handlers
+    if (e && e.stopPropagation) e.stopPropagation();
+
+    try {
+      // remember whether window was click-through
+      prevClickThroughRef.current = clickThrough;
+
+      if (clickThrough) {
+        // disable click-through so we can receive mouse events for dragging
+        await invoke('toggle_clickthrough', { enable: false });
+        setClickThrough(false);
+        setStatus('Window is interactive.');
+      }
+
+      // start native drag (this requires a user gesture — i.e., mousedown)
+      await appWindow.startDragging();
+    } catch (err) {
+      console.error('Drag start error:', err);
+    }
+  };
+
+  // On mouse up, restore click-through if it was previously enabled
+  const stopDragRestoreClickThrough = async (e) => {
+    if (e && e.stopPropagation) e.stopPropagation();
+    try {
+      if (prevClickThroughRef.current) {
+        await invoke('toggle_clickthrough', { enable: true });
+        setClickThrough(true);
+        setStatus('Window is click-through.');
+      }
+    } catch (err) {
+      console.error('Restore click-through error:', err);
+    } finally {
+      prevClickThroughRef.current = null;
+    }
+  };
+
+  // To hide the window
+  const handleHideWindow = async (e) => {
+    if (e && e.stopPropagation) e.stopPropagation();
+    try {
+      // Add a check for appWindow.current and call .hide() on it as appWindow is a useRef
+      if (appWindow.current) {
+        await appWindow.current.hide();
+      }
+    }
+    catch (err) {
+      console.error('Failed to hide window:', err);
+    }
+  };
+
+  return (
+    <div className="app-root">
+      {/* Floating top-centered widget */}
+      <div className={`floating-widget ${widgetOpen ? 'open' : 'closed'}`}>
+        {/* Collapsed-bar */}
+        <div className="widget-bar" 
+          onClick={() => setWidgetOpen(true)} 
+          role="button" 
+          aria-label="Open assistant"
+          onMouseDown={startDragWithClickThroughHandling}    
+          onMouseUp={stopDragRestoreClickThrough}            
+          onTouchStart={startDragWithClickThroughHandling}   
+          onTouchEnd={stopDragRestoreClickThrough}           
+        >
+          <div className="widget-left">
+            <div className="icon-circle" title="Assistant">
+              <video 
+                width="18" 
+                height="18" 
+                autoPlay 
+                loop 
+                muted 
+                playsInline
+              >
+                <source src={logoVideo} type="video/mp4" />
+                Your browser does not support the video tag.
+              </video>
+            </div>
+            <div className="bar-label">Jarvis</div>
+          </div>
+
+          <div className="widget-actions">
+            <button
+              className={`mini-btn listen ${isRecording ? 'recording' : ''}`}
+              onClick={(e) => { 
+                e.stopPropagation(); 
+                
+                // 1. This function now handles both starting AND stopping
+                handleToggleRecording(); 
+                
+                // 2. Toggle the "listen" specific UI
+                setListenOpen(prevState => !prevState); 
+                
+                // 3. Only open the widget and set tab when we START recording
+                if (!isRecording) { 
+                  setWidgetOpen(true); 
+                  setActiveTab('transcript'); 
+                }
+              }}
+            >
+              <span className="dot" />
+              {isRecording ? 'Stop' : 'Listen'}{/* Bonus: Dynamic text */}
+            </button>
+
+            <button className="mini-text" 
+              onClick={(e) => { 
+                e.stopPropagation(); 
+                // This function gets the current value and returns the opposite
+                setWidgetOpen(currentValue => !currentValue); 
+                setActiveTab('ai'); 
+              }}>
+              Ask question
+            </button>
+
+            <button className="icon-hide" onClick={handleHideWindow}>
+              ✕
+            </button>
+          </div>
+        </div>
+
+        {/* Expanded panel */}
+        <div className={`panel ${widgetOpen ? 'panel-open' : ''}`} onClick={(e) => e.stopPropagation()}>
+          <div className="panel-header">
+            <div className="panel-title">
+              <strong>{activeTab === 'transcript' ? 'Live Transcript' : 'Assistant'}</strong>
+              <span className="panel-sub">{status}</span>
+            </div>
+
+            <div className="panel-controls">
+              <button className={`pill ${isRecording ? 'active' : ''}`} onClick={() => { handleToggleRecording(); setActiveTab('transcript'); }}>
+                {isRecording ? 'Stop' : 'Listen'}
+              </button>
+              <button className="pill" onClick={() => { setActiveTab('ai'); }}>
+                Analyze
+              </button>
+              <button className="pill" onClick={handleToggleClickThrough}>
+                {clickThrough ? 'Disable ClickThrough' : 'Enable ClickThrough'}
+              </button>
+              <button className="icon-hide" onClick={() => setWidgetOpen(false)}>Hide</button>
+            </div>
+          </div>
+
+          <div className="panel-body">
+            <div className="left-column">
+              <div className="tab-header">
+                <button className={`tab ${activeTab === 'transcript' ? 'active' : ''}`} onClick={() => setActiveTab('transcript')}>Transcript</button>
+                <button className={`tab ${activeTab === 'ai' ? 'active' : ''}`} onClick={() => setActiveTab('ai')}>AI</button>
+              </div>
+
+              <div className="content-area">
+                {activeTab === 'transcript' ? (
+                  <pre className="transcript-box">{transcript || 'Live transcript will appear here...'}</pre>
+                ) : (
+                  <div className="ai-box">
+                    {aiResponse ? <ReactMarkdown>{aiResponse}</ReactMarkdown> : <p>AI response will appear here.</p>}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="right-column">
+              <div className="right-header">Quick Actions</div>
+              <div className="right-body">
+                <button className="action" onClick={handleAnalyze} disabled={!transcript || isRecording}>Analyze Transcript</button>
+                <div className="divider" />
+                <div className="input-row">
+                  <input
+                    type="text"
+                    value={generalQuery}
+                    onChange={(e) => setGeneralQuery(e.target.value)}
+                    placeholder="Ask Gemini anything..."
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        handleAskGemini(generalQuery);
+                        setGeneralQuery('');
+                      }
+                    }}
+                  />
+                  <button className="send" onClick={() => { handleAskGemini(generalQuery); setGeneralQuery(''); }} disabled={!generalQuery}>→</button>
+                </div>
+                <p className="status-small">{status}</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="panel-footer">
+            <small>
+              Tip: click Listen to start live transcript<br /> 
+              — click Hide to collapse<br /> 
+              — press "Ctrl+Shift+C" to toggle click-through mode<br /> 
+              — press "Ctrl+\ to hide Jarvis.</small>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+
+---------------------------------------------------------------------------------------------
+
+App.css :
+
+
+
+:root{
+  --glass: rgba(16,18,22,0.55);
+  --panel-bg: rgba(24,26,30,0.86);
+  --muted: #9aa4b2;
+  --accent: #00aaff;
+}
+
+/* Root layout */
+.app-root {
+  height: 100vh;
+  width: 100vw;
+  position: relative;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: #eaeef2;
+  background: transparent;
+}
+
+/* the floating widget container (top center) */
+.floating-widget {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  pointer-events: auto;
+  -webkit-app-region: drag;
+}
+
+/* Collapsed bar */
+.widget-bar {
+  background: linear-gradient(180deg, rgba(30,30,40,0.95), rgba(20,20,28,0.9));
+  border-radius: 28px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+  border: 1px solid rgba(255,255,255,0.06);
+  cursor: default;
+  user-select: none;
+  min-width: 240px;
+  max-width: 480px;
+}
+
+/* left area */
+.widget-left {
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+
+/* circular icon */
+.icon-circle {
+  position: relative; /* <-- ADD THIS LINE */
+
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(180deg, rgba(0,170,255,0.14), rgba(0,170,255,0.06));
+}
+
+/* ADD THIS ENTIRE NEW RULE */
+.icon-circle video {
+  width: 33.5px;          /* Your video's size from the HTML */
+  height: 34px;
+  border-radius: 50%;   /* Make the video a circle */
+  object-fit: cover;    /* Important: prevents stretching */
+  z-index: 1;           /* <-- The key! Lifts the video to the top layer */
+  transform: scale(1.3); /* <-- Add this for a 30% zoom */
+}
+
+/* label text */
+.bar-label{
+  font-weight:700;
+  font-size:14px;
+  color: #edf6ff;
+}
+
+/* actions on the right */
+.widget-actions{
+  margin-left:auto;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  -webkit-app-region: no-drag;
+}
+
+/* mini listen button with dot */
+.mini-btn {
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding:8px 12px;
+  border-radius:18px;
+  border: none;
+  background: rgba(255,255,255,0.03);
+  color: #e8faff;
+  cursor:default;
+  font-weight:600;
+  transition: transform .12s ease;
+}
+.mini-btn:active{ transform: scale(.98); }
+.mini-btn .dot {
+  width:8px;height:8px;border-radius:50%;background: #7ef0b5; box-shadow:0 0 8px rgba(126,240,181,0.18);
+}
+.mini-btn.recording .dot{ background: #ff6b6b; box-shadow:0 0 8px rgba(255,100,100,0.18); }
+.mini-btn:hover {
+  background-color: rgba(255, 255, 255, 0.1); 
+}
+
+/* small textual button */
+.mini-text{
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  font-weight:600;
+  cursor:default;
+  padding:8px 10px;
+  border-radius:8px;
+  transition: background-color 0.2s ease;
+}
+.mini-text:hover {
+  background-color: rgba(255, 255, 255, 0.1); 
+}
+
+/* hide icon */
+.icon-hide{
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size:14px;
+  cursor: default;
+  padding:1px 4px;
+}
+.icon-hide:hover {
+  background-color: rgba(255, 255, 255, 0.05); 
+}
+
+/* panel (expanded) */
+.panel {
+  width: 820px;
+  max-width: calc(100vw - 40px);
+  height: 460px;
+  border-radius: 12px;
+  transform-origin: top center;
+  opacity: 0;
+  transform: translateY(-10px) scale(.98);
+  pointer-events: none;
+  transition: all 220ms cubic-bezier(.2,.9,.2,1);
+  box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+/* when open */
+.panel-open {
+  opacity: 1;
+  transform: translateY(6px) scale(1);
+  pointer-events: all;
+}
+
+/* glass look */
+.panel,
+.widget-bar {
+  backdrop-filter: blur(8px) saturate(120%);
+  background: var(--panel-bg);
+  border: 1px solid rgba(255,255,255,0.05);
+}
+
+/* header */
+.panel-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:12px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.panel-title strong{ font-size:15px; }
+.panel-sub { margin-left:10px; color:var(--muted); font-size:12px; }
+
+/* header controls */
+.panel-controls{ 
+  display:flex; 
+  gap:8px; 
+  align-items:center; 
+  -webkit-app-region: no-drag;
+}
+.pill {
+  padding:8px 12px;
+  border-radius:10px;
+  border:none;
+  cursor:default;
+  background: rgba(255,255,255,0.03);
+  color: #eaf6ff;
+  font-weight:600;
+}
+.pill.active{ background: linear-gradient(90deg, rgba(0,170,255,0.15), rgba(0,200,255,0.08)); box-shadow: inset 0 0 18px rgba(0,170,255,0.02); }
+.pill:hover {
+  background-color: rgba(255, 255, 255, 0.05); 
+}
+/* panel body grid */
+.panel-body{
+  display:grid;
+  grid-template-columns: 1fr 320px;
+  gap:16px;
+  padding:16px;
+  height:100%;
+  box-sizing:border-box;
+}
+
+/* left column (transcript + ai) */
+.left-column{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  min-width:0; /* allow overflow hidden */
+}
+
+/* tabs */
+.tab-header{ 
+  display:flex; 
+  gap:8px; 
+  margin-bottom:6px;
+  -webkit-app-region: no-drag; 
+}
+.tab {
+  padding:8px 10px;
+  border-radius:8px;
+  background: rgba(255,255,255,0.02);
+  border:none;
+  color:var(--muted);
+  font-weight:700;
+  cursor:default;
+}
+.tab.active{
+  background: linear-gradient(90deg, rgba(0,170,255,0.12), rgba(0,170,255,0.03));
+  color: #eaf6ff;
+}
+
+/* content area (scrollable) */
+.content-area{
+  flex:1;
+  overflow-y: auto;              /* ensures vertical scroll */
+  overflow-x: hidden;            /* prevents horizontal overflow */
+  border-radius:8px;
+  padding:12px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.06));
+  border: 1px solid rgba(255,255,255,0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* transcript box style */
+.transcript-box{
+  white-space: pre-wrap;         /* preserve line breaks, wrap text */
+  word-wrap: break-word;         /* break long words if needed */
+  overflow-wrap: anywhere;       /* extra safety for very long text */
+  overflow-y: auto;
+  overflow-x: hidden;
+  max-height: 285px;             
+  font-size:13px;
+  line-height:1.45;
+  color:#e9f0f6;
+  margin:0;
+  padding:10px;
+  border-radius:8px;
+  background: rgba(255,255,255,0.02);
+  -webkit-app-region: no-drag;
+}
+
+/* AI response */
+.ai-box{
+  font-size:13px;
+  line-height:1.45;
+  color:#e9f0f6;
+  overflow-y: auto;              /* response scroll if too long */
+  overflow-x: hidden;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  max-height: 285px;             /* keeps within a neat box */
+  padding:10px;
+  border-radius:8px;
+  background: rgba(0,170,255,0.05);
+  border: 1px solid rgba(0,170,255,0.1);
+  -webkit-app-region: no-drag;
+}
+
+
+/* right column */
+.right-column{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.right-header{ font-weight:700; color:var(--muted); font-size:13px; }
+.right-body{ display:flex; flex-direction:column; gap:10px; }
+
+.action{
+  padding:10px;
+  border-radius:10px;
+  border:none;
+  cursor:default;
+  font-weight:700;
+  background: linear-gradient(90deg, rgba(0,170,255,0.18), rgba(0,170,255,0.06));
+  color:#e9faff;
+  -webkit-app-region: no-drag;
+}
+.action:disabled{ opacity:0.5; cursor:default; transform:none; }
+
+.divider{ height:1px; background:rgba(255,255,255,0.03); border-radius:2px; }
+
+.input-row{ 
+  display:flex; 
+  gap:8px; 
+  align-items:center; 
+  -webkit-app-region: no-drag;
+}
+.input-row input{
+  flex:1;
+  padding:8px 10px;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,0.04);
+  background: rgba(0,0,0,0.15);
+  color: #eaf6ff;
+  font-weight:600;
+  -webkit-app-region: no-drag;
+}
+.send{
+  padding:8px 10px;
+  border-radius:8px;
+  border:none;
+  background: rgba(255,255,255,0.03);
+  color:var(--muted);
+  cursor:default;
+  -webkit-app-region: no-drag;
+}
+
+/* footer */
+.panel-footer{
+  padding:8px 14px;
+  border-top: 1px solid rgba(255,255,255,0.03);
+  color:var(--muted);
+  font-size:12px;
+}
+.status-small{ color:var(--muted); font-size:12px; margin-top:6px; }
+
+/* responsive */
+@media (max-width:900px){
+  .panel { width: calc(100vw - 28px); height: 60vh; }
+  .panel-body { grid-template-columns: 1fr; }
+  .right-column { order: 2; }
+}
+
+/* Global scrollbar style */
+::-webkit-scrollbar {
+  width: 8px;             /* slim scrollbar */
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);   /* subtle track */
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 170, 255, 0.6);      /* your theme color */
+  border-radius: 8px;
+  transition: background 0.3s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 170, 255, 0.9);      /* brighter on hover */
+}
+
+html, body, #root {
+  cursor: default !important;
+  overflow: hidden !important;
+}
+
+
+---------------------------------------------------------------------------------------------
+
+Cargo.toml :
+
+[package]
+name = "cluely-pet-project"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "cluely_pet_project_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.8.0", features = [] }
+tauri-plugin-opener = "2.5.0"
+tauri-plugin-process = "2.3.0"
+tauri-plugin-global-shortcut = "2.0"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+dotenvy = "0.15.7"
+
+windows = { version = "0.56.0", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "native-tls"] }
+
+regex = "1.11.1"
+
+
+-----------------------------------------------------------------------------------------------
+
+
+-> tauri.conf.json :
+
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Jarvis",
+  "version": "0.1.0",
+  "identifier": "com.prady.Jarvis",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Jarvis",
+        "label": "main",
+        "width": 950,
+        "height": 550,
+        "transparent": true,     
+        "decorations": false,
+        "shadow": false,             
+        "resizable": false,
+        "alwaysOnTop": true,     
+        "fullscreen": false,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/whisper-stream.exe",
+      "resources/ggml-base.en.bin",
+      "resources/ggml-medium.en.bin"
+    ]
+  }
+}
+
+
+
+----------------------------------------------------------------------------------------------------
+
+-> default.json :
+
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["*"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "process:allow-exit"
+  ]
+}
+
+---------------------------------------------------------------------------------------------
