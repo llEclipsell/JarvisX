@@ -1,6 +1,7 @@
 
 -> main.rs :
 
+
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
@@ -146,7 +147,7 @@ fn stop_live_transcription(state: tauri::State<Mutex<AppState>>) -> Result<(), S
 async fn call_gemini_api(prompt: String) -> Result<String, String> {
     let api_key = env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not found in .env file".to_string())?;
         let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={}",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
         api_key
     );
     let request_body = GeminiRequest { contents: vec![Content { parts: vec![Part { text: prompt }] }] };
@@ -243,16 +244,15 @@ fn main() {
                     
                     // Emit the new state to the frontend
                     let _ = window.emit("click_through_toggled", is_enabled);
-
-                    println!("Click-through toggled to: {}", is_enabled);
+                    
                     // Update the timestamp
                     state_guard.last_shortcut_time = now;
                 }
             }).expect("Failed to set shortcut handler");  
                      
             // hide/show toggle
-            let _ = shortcuts.unregister("Ctrl+Shift+H");
-            shortcuts.on_shortcut("Ctrl+Shift+H", move |app, _shortcut, _event| {
+            let _ = shortcuts.unregister("Ctrl+\\");
+            shortcuts.on_shortcut("Ctrl+\\", move |app, _shortcut, _event| {
                 if let Some(window) = app.get_webview_window("main") {
                     
                     let state = app.state::<Mutex<AppState>>();
@@ -290,7 +290,6 @@ fn main() {
 -> App.jsx :
 
 
-
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -304,8 +303,7 @@ function App() {
 
   async function getResourcePaths() {
     const streamExe = await resolveResource("resources/whisper-stream.exe");
-    const modelBin = await resolveResource("resources/ggml-base.en.bin");
-    // const modelBin = await resolveResource("resources/ggml-medium.en.bin");
+    const modelBin = await resolveResource("resources/models/ggml-base.en.bin");
     return { streamExe, modelBin };
   }
 
@@ -690,7 +688,6 @@ export default App;
 ---------------------------------------------------------------------------------------------
 
 App.css :
-
 
 
 :root{
@@ -1088,9 +1085,9 @@ html, body, #root {
 Cargo.toml :
 
 [package]
-name = "cluely-pet-project"
+name = "Jarvis"
 version = "0.1.0"
-description = "A Tauri App"
+description = "AI Assistant"
 authors = ["you"]
 edition = "2021"
 
@@ -1166,9 +1163,8 @@ regex = "1.11.1"
       "icons/icon.ico"
     ],
     "resources": [
-      "resources/whisper-stream.exe",
-      "resources/ggml-base.en.bin",
-      "resources/ggml-medium.en.bin"
+      "resources/*",
+      "resources/models/*"
     ]
   }
 }

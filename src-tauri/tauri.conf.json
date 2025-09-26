@@ -41,9 +41,8 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "resources/whisper-stream.exe",
-      "resources/ggml-base.en.bin",
-      "resources/ggml-medium.en.bin"
+      "resources/*",
+      "resources/models/*"
     ]
   }
 }

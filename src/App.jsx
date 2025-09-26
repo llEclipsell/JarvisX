@@ -12,8 +12,7 @@ function App() {
 
   async function getResourcePaths() {
     const streamExe = await resolveResource("resources/whisper-stream.exe");
-    const modelBin = await resolveResource("resources/ggml-base.en.bin");
-    // const modelBin = await resolveResource("resources/ggml-medium.en.bin");
+    const modelBin = await resolveResource("resources/models/ggml-base.en.bin");
     return { streamExe, modelBin };
   }
 

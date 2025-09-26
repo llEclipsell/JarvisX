@@ -45,4 +45,4 @@ src-tauri/target
 Thumbs.db
 
 # AI Models
-src-tauri/resources/*.bin
+src-tauri/resources/models/*

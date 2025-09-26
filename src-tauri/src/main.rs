@@ -144,7 +144,7 @@ fn stop_live_transcription(state: tauri::State<Mutex<AppState>>) -> Result<(), S
 async fn call_gemini_api(prompt: String) -> Result<String, String> {
     let api_key = env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not found in .env file".to_string())?;
         let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={}",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
         api_key
     );
     let request_body = GeminiRequest { contents: vec![Content { parts: vec![Part { text: prompt }] }] };
